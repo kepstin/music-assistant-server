@@ -240,13 +240,13 @@ class ListenBrainz(PluginProvider):
         self.mass.subscribe(self._queue_updated, EventType.QUEUE_UPDATED)
         self.mass.subscribe(self._queue_time_updated, EventType.QUEUE_TIME_UPDATED)
 
-    def _get_player_queue(self, queue_id) -> ListenBrainzPlayerQueue:
+    def _get_player_queue(self, queue_id: str) -> ListenBrainzPlayerQueue:
         player_queue = self._player_queues.get(queue_id)
         if player_queue is None:
             player_queue = ListenBrainzPlayerQueue()
         return player_queue
 
-    def _record_listen(self, queue_id) -> None:
+    def _record_listen(self, queue_id: str) -> None:
         player_queue = self._get_player_queue(queue_id)
         if player_queue.listen_recorded:
             # Already recorded this listen, nothing to do.
@@ -272,19 +272,20 @@ class ListenBrainz(PluginProvider):
 
         player_queue.listen_recorded = True
 
+    def _notify_playing_now(self, player_queue: ListenBrainzPlayerQueue) -> None:
+        if player_queue.track_metadata is None:
+            return
+
+        self.logger.debug(
+            "Notifying playing now for %s - %s",
+            player_queue.track_metadata.artist_name,
+            player_queue.track_metadata.track_name,
+        )
+
     def _queue_updated(self, event: MassEvent) -> None:
         queue_id = event.object_id
         player_queue = self._get_player_queue(queue_id)
         new_player_queue = ListenBrainzPlayerQueue.from_player_queue(cast(PlayerQueue, event.data))
-        assert new_player_queue is not None
-
-        if new_player_queue.state != player_queue.state:
-            self.logger.debug(
-                "Queue %s updated, state changed from %s to %s",
-                queue_id,
-                player_queue.state,
-                new_player_queue.state,
-            )
 
         if new_player_queue.state != PlayerState.PLAYING:
             # Playback has been stopped or paused
@@ -299,13 +300,8 @@ class ListenBrainz(PluginProvider):
             new_player_queue = player_queue
         else:
             # Playback has been started or playing track has changed
-            self.logger.debug(
-                "Queue %s updated, new track is %s - %s",
-                queue_id,
-                new_player_queue.track_metadata.artist_name,
-                new_player_queue.track_metadata.track_name,
-            )
             new_player_queue.playback_started_time = time.time()
+            self._notify_playing_now(new_player_queue)
 
             if player_queue.state == PlayerState.PLAYING:
                 self._record_listen(queue_id)
