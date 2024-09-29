@@ -206,8 +206,12 @@ class ListenBrainz(PluginProvider):
         def queue_updated(event: MassEvent) -> None:
             self._queue_updated(event)
 
-        self.mass.subscribe(EventType.QUEUE_TIME_UPDATED)
-        self.mass.subscribe(EventType.QUEUE_UPDATED)
+        self.mass.subscribe(queue_updated, EventType.QUEUE_UPDATED)
+
+        def queue_time_updated(event: MassEvent) -> None:
+            self._queue_time_updated(event)
+
+        self.mass.subscribe(queue_time_updated, EventType.QUEUE_TIME_UPDATED)
 
 
 # Listens should be submitted for tracks when the user has listened to half the track or 4 minutes
