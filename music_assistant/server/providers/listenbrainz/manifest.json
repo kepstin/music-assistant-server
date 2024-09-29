@@ -1,0 +1,11 @@
+{
+    "type": "plugin",
+    "domain": "listenbrainz",
+    "name": "ListenBrainz",
+    "description": "ListenBrainz is an open music listen history store that makes listen history data available to the public. This plugin sends records of your listens to ListenBrainz.",
+    "codeowners": ["@music-assistant"],
+    "requirements": [],
+    "documentation": "",
+    "multi_instance": true,
+    "icon": "mdi-headphones"
+  }
