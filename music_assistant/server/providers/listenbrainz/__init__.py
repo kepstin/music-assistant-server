@@ -4,9 +4,11 @@ This plugin is only for sending listens to ListenBrainz. A separate music provid
 later to support playlist and radio features.
 """
 
+import time
 from dataclasses import dataclass
+from typing import cast
 
-from mashumaro import DataClassDictMixin
+from mashumaro.mixins.orjson import DataClassORJSONMixin
 
 from music_assistant.common.models.config_entries import (
     ConfigEntry,
@@ -14,9 +16,10 @@ from music_assistant.common.models.config_entries import (
     ConfigValueType,
     ProviderConfig,
 )
-from music_assistant.common.models.enums import EventType, ExternalID
+from music_assistant.common.models.enums import EventType, ExternalID, PlayerState
 from music_assistant.common.models.event import MassEvent
 from music_assistant.common.models.media_items import Radio, Track, is_track
+from music_assistant.common.models.player_queue import PlayerQueue
 from music_assistant.common.models.provider import ProviderManifest
 from music_assistant.server import MusicAssistant
 from music_assistant.server.helpers.throttle_retry import ThrottlerManager
@@ -39,9 +42,9 @@ async def setup(
 
 
 async def get_config_entries(
-    _mass: MusicAssistant,
+    mass: MusicAssistant,  # noqa: ARG001
     instance_id: str | None = None,  # noqa: ARG001
-    _action: str | None = None,
+    action: str | None = None,  # noqa: ARG001
     values: dict[str, ConfigValueType] | None = None,
 ) -> tuple[ConfigEntry, ...]:
     """
@@ -96,7 +99,7 @@ MUSIC_SERVICE_DOMAIN_MAPPING = {
 
 
 @dataclass(kw_only=True)
-class ListenBrainzAdditionalInfo(DataClassDictMixin):
+class ListenBrainzAdditionalInfo(DataClassORJSONMixin):
     """Model for additional identifying information about a track to send to ListenBrainz."""
 
     # All fields are optional, but the additional_information as a whole should be omitted if empty.
@@ -109,7 +112,7 @@ class ListenBrainzAdditionalInfo(DataClassDictMixin):
     tracknumber: int | None = None
     isrc: str | None = None
     spotify_id: str | None = None
-    tags: [str] | None = None
+    tags: set[str] | None = None
     # The program being used to listen to music.
     media_player: str | None = None
     media_player_version: str | None = None
@@ -127,7 +130,7 @@ class ListenBrainzAdditionalInfo(DataClassDictMixin):
 
 
 @dataclass(kw_only=True)
-class ListenBrainzTrackMetadata(DataClassDictMixin):
+class ListenBrainzTrackMetadata(DataClassORJSONMixin):
     """Model for a metadata about a track to send to ListenBrainz."""
 
     artist_name: str
@@ -182,38 +185,132 @@ class ListenBrainzTrackMetadata(DataClassDictMixin):
 
             additional_info.tracknumber = media_item.track_number
 
+        return track_metadata
+
     @classmethod
-    def from_media_item(cls, media_item: Track | Radio) -> "ListenBrainzTrackMetadata":
+    def from_media_item(
+        cls, media_item: Track | Radio | None
+    ) -> "ListenBrainzTrackMetadata | None":
         """Create a ListenBrainz Track Metadata from a MusicAssistant MediaItem."""
+        if media_item is None:
+            return None
+
         if is_track(media_item):
-            return cls.from_track(cls, media_item)
+            return cls.from_track(media_item)
         else:
-            return cls.from_radio(cls, media_item)
+            return cls.from_radio(media_item)
+
+
+@dataclass(kw_only=True)
+class ListenBrainzPlayerQueue:
+    """Player Queue state monitoring for ListenBrainz."""
+
+    state: PlayerState = PlayerState.IDLE
+    playback_started_time: float | None = None
+    track_metadata: ListenBrainzTrackMetadata | None = None
+    listen_recorded: bool = False
+
+    @classmethod
+    def from_player_queue(cls, player_queue: PlayerQueue) -> "ListenBrainzPlayerQueue":
+        """Create ListenBrainz Player queue state from PlayerQueue."""
+        track_metadata = None
+        if player_queue.current_item is not None:
+            track_metadata = ListenBrainzTrackMetadata.from_media_item(
+                player_queue.current_item.media_item
+            )
+        return cls(
+            state=player_queue.state,
+            track_metadata=track_metadata,
+        )
 
 
 class ListenBrainz(PluginProvider):
     """The ListenBrainz listen recording plugin."""
 
     throttler = ThrottlerManager(rate_limit=1)
-    user_token: str
-    api_base_url: str
+    _user_token: str
+    _api_base_url: str
+    _player_queues: dict[str, ListenBrainzPlayerQueue] = {}
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
-        self.user_token = self.config.get_value(CONF_USER_TOKEN)
-        self.api_base_url = self.config.get_value(CONF_API_BASE_URL)
+        self._user_token = self.config.get_value(CONF_USER_TOKEN)
+        self._api_base_url = self.config.get_value(CONF_API_BASE_URL)
 
-        def queue_updated(event: MassEvent) -> None:
-            self._queue_updated(event)
+        self.mass.subscribe(self._queue_updated, EventType.QUEUE_UPDATED)
+        self.mass.subscribe(self._queue_time_updated, EventType.QUEUE_TIME_UPDATED)
 
-        self.mass.subscribe(queue_updated, EventType.QUEUE_UPDATED)
+    def _get_player_queue(self, queue_id) -> ListenBrainzPlayerQueue:
+        player_queue = self._player_queues.get(queue_id)
+        if player_queue is None:
+            player_queue = ListenBrainzPlayerQueue()
+        return player_queue
 
-        def queue_time_updated(event: MassEvent) -> None:
-            self._queue_time_updated(event)
+    def _record_listen(self, queue_id) -> None:
+        player_queue = self._get_player_queue(queue_id)
+        if player_queue.listen_recorded:
+            # Already recorded this listen, nothing to do.
+            return
 
-        self.mass.subscribe(queue_time_updated, EventType.QUEUE_TIME_UPDATED)
+        if player_queue.track_metadata is None or player_queue.playback_started_time is None:
+            return
 
+        # Listens should be submitted for tracks when the user has listened to half the track or
+        # 4 minutes of the track, whichever is lower. If the user hasn't listened to 4 minutes or
+        # half the track, it doesn't fully count as a listen and should not be submitted.
+        elapsed_time = time.time() - player_queue.playback_started_time
+        duration = player_queue.track_metadata.additional_info.duration
+        if not (elapsed_time >= (duration * 0.5) or elapsed_time >= 4 * 60):
+            return
 
-# Listens should be submitted for tracks when the user has listened to half the track or 4 minutes
-# of the track, whichever is lower. If the user hasn't listened to 4 minutes or half the track, it
-#  doesn't fully count as a listen and should not be submitted.
+        self.logger.debug(
+            "Recording listen for %s - %s",
+            player_queue.track_metadata.artist_name,
+            player_queue.track_metadata.track_name,
+        )
+        # TODO: actually enqueue and send the listen
+
+        player_queue.listen_recorded = True
+
+    def _queue_updated(self, event: MassEvent) -> None:
+        queue_id = event.object_id
+        player_queue = self._get_player_queue(queue_id)
+        new_player_queue = ListenBrainzPlayerQueue.from_player_queue(cast(PlayerQueue, event.data))
+        assert new_player_queue is not None
+
+        if new_player_queue.state != player_queue.state:
+            self.logger.debug(
+                "Queue %s updated, state changed from %s to %s",
+                queue_id,
+                player_queue.state,
+                new_player_queue.state,
+            )
+
+        if new_player_queue.state != PlayerState.PLAYING:
+            # Playback has been stopped or paused
+            if player_queue.state == PlayerState.PLAYING:
+                self._record_listen(queue_id)
+        elif (
+            player_queue.state == PlayerState.PLAYING
+            and player_queue.track_metadata == new_player_queue.track_metadata
+        ):
+            # TODO: Figure out how to handle detecting restarts of looped tracks
+            # No change to state affecting ListenBrainz plugin
+            new_player_queue = player_queue
+        else:
+            # Playback has been started or playing track has changed
+            self.logger.debug(
+                "Queue %s updated, new track is %s - %s",
+                queue_id,
+                new_player_queue.track_metadata.artist_name,
+                new_player_queue.track_metadata.track_name,
+            )
+            new_player_queue.playback_started_time = time.time()
+
+            if player_queue.state == PlayerState.PLAYING:
+                self._record_listen(queue_id)
+
+        self._player_queues[event.object_id] = new_player_queue
+
+    def _queue_time_updated(self, event: MassEvent) -> None:
+        self._record_listen(event.object_id)
