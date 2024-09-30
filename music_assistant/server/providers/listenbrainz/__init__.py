@@ -6,10 +6,12 @@ later to support playlist and radio features.
 
 import time
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
+from mashumaro.config import BaseConfig
 from mashumaro.mixins.orjson import DataClassORJSONMixin
 
+from music_assistant.common.helpers.json import json_loads
 from music_assistant.common.models.config_entries import (
     ConfigEntry,
     ConfigEntryType,
@@ -17,12 +19,13 @@ from music_assistant.common.models.config_entries import (
     ProviderConfig,
 )
 from music_assistant.common.models.enums import EventType, ExternalID, PlayerState
+from music_assistant.common.models.errors import ResourceTemporarilyUnavailable
 from music_assistant.common.models.event import MassEvent
 from music_assistant.common.models.media_items import Radio, Track, is_track
 from music_assistant.common.models.player_queue import PlayerQueue
 from music_assistant.common.models.provider import ProviderManifest
 from music_assistant.server import MusicAssistant
-from music_assistant.server.helpers.throttle_retry import ThrottlerManager
+from music_assistant.server.helpers.throttle_retry import ThrottlerManager, throttle_with_retries
 from music_assistant.server.models import ProviderInstanceType
 from music_assistant.server.models.plugin import PluginProvider
 
@@ -128,6 +131,14 @@ class ListenBrainzAdditionalInfo(DataClassORJSONMixin):
     duration_ms: int | None = None
     duration: int | None = None
 
+    # Non-standard fields
+    discnumber: int | None = None  # "discnumber" is also used by a few other players
+
+    class Config(BaseConfig):
+        """Mashumaro serialization config."""
+
+        omit_none = True
+
 
 @dataclass(kw_only=True)
 class ListenBrainzTrackMetadata(DataClassORJSONMixin):
@@ -139,6 +150,11 @@ class ListenBrainzTrackMetadata(DataClassORJSONMixin):
     # Optional fields
     release_name: str | None = None
     additional_info: ListenBrainzAdditionalInfo | None = None
+
+    class Config(BaseConfig):
+        """Mashumaro serialization config."""
+
+        omit_none = True
 
     @classmethod
     def from_track(cls, media_item: Track) -> "ListenBrainzTrackMetadata":
@@ -184,6 +200,15 @@ class ListenBrainzTrackMetadata(DataClassORJSONMixin):
                     additional_info.release_group_mbid = ext_id
 
             additional_info.tracknumber = media_item.track_number
+            additional_info.discnumber = media_item.disc_number
+
+        for provider in media_item.provider_mappings:
+            music_service = MUSIC_SERVICE_DOMAIN_MAPPING.get(provider.provider_domain)
+            if music_service is None:
+                continue
+            additional_info.music_service = music_service
+            additional_info.origin_url = provider.url
+            break
 
         return track_metadata
 
@@ -198,7 +223,20 @@ class ListenBrainzTrackMetadata(DataClassORJSONMixin):
         if is_track(media_item):
             return cls.from_track(media_item)
         else:
-            return cls.from_radio(media_item)
+            return None  # TODO: figure out how to handle radio
+
+
+@dataclass(kw_only=True)
+class ListenBrainzListenPayload(DataClassORJSONMixin):
+    """Model for a ListenBrainz listen payload."""
+
+    listened_at: int | None
+    track_metadata: ListenBrainzTrackMetadata
+
+    class Config(BaseConfig):
+        """Mashumaro serialization config."""
+
+        omit_none = True
 
 
 @dataclass(kw_only=True)
@@ -210,19 +248,6 @@ class ListenBrainzPlayerQueue:
     track_metadata: ListenBrainzTrackMetadata | None = None
     listen_recorded: bool = False
 
-    @classmethod
-    def from_player_queue(cls, player_queue: PlayerQueue) -> "ListenBrainzPlayerQueue":
-        """Create ListenBrainz Player queue state from PlayerQueue."""
-        track_metadata = None
-        if player_queue.current_item is not None:
-            track_metadata = ListenBrainzTrackMetadata.from_media_item(
-                player_queue.current_item.media_item
-            )
-        return cls(
-            state=player_queue.state,
-            track_metadata=track_metadata,
-        )
-
 
 class ListenBrainz(PluginProvider):
     """The ListenBrainz listen recording plugin."""
@@ -230,7 +255,14 @@ class ListenBrainz(PluginProvider):
     throttler = ThrottlerManager(rate_limit=1)
     _user_token: str
     _api_base_url: str
-    _player_queues: dict[str, ListenBrainzPlayerQueue] = {}
+    _player_queues: dict[str, ListenBrainzPlayerQueue]
+    _listen_queue: list[ListenBrainzListenPayload]
+
+    def __init__(self, *args, **kwargs) -> None:
+        """Initialize provider."""
+        super().__init__(*args, **kwargs)
+        self._player_queues = {}
+        self._listen_queue = []
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
@@ -245,6 +277,23 @@ class ListenBrainz(PluginProvider):
         if player_queue is None:
             player_queue = ListenBrainzPlayerQueue()
         return player_queue
+
+    def _create_player_queue(self, player_queue: PlayerQueue) -> ListenBrainzPlayerQueue:
+        track_metadata = None
+        if player_queue.state == PlayerState.PLAYING and player_queue.current_item is not None:
+            self.logger.debug("Media item: %s", str(player_queue.current_item.media_item.to_dict()))
+            track_metadata = ListenBrainzTrackMetadata.from_media_item(
+                player_queue.current_item.media_item
+            )
+            if track_metadata is not None:
+                track_metadata.additional_info.media_player = "Music Assistant"
+                track_metadata.additional_info.media_player_version = self.mass.version
+                track_metadata.additional_info.submission_client = "Music Assistant"
+                track_metadata.additional_info.submission_client_version = self.mass.version
+        return ListenBrainzPlayerQueue(
+            state=player_queue.state,
+            track_metadata=track_metadata,
+        )
 
     def _record_listen(self, queue_id: str) -> None:
         player_queue = self._get_player_queue(queue_id)
@@ -263,12 +312,22 @@ class ListenBrainz(PluginProvider):
         if not (elapsed_time >= (duration * 0.5) or elapsed_time >= 4 * 60):
             return
 
+        listen_payload = ListenBrainzListenPayload(
+            listened_at=int(player_queue.playback_started_time),
+            track_metadata=player_queue.track_metadata,
+        )
+
         self.logger.debug(
-            "Recording listen for %s - %s",
+            "Recording listen for %s - %s: %s",
             player_queue.track_metadata.artist_name,
             player_queue.track_metadata.track_name,
+            listen_payload.to_json(),
         )
-        # TODO: actually enqueue and send the listen
+
+        self._listen_queue.append(listen_payload)
+        self.logger.debug("Submission queue contains %i entries", len(self._listen_queue))
+
+        # TODO: actually send the queued listens
 
         player_queue.listen_recorded = True
 
@@ -277,15 +336,16 @@ class ListenBrainz(PluginProvider):
             return
 
         self.logger.debug(
-            "Notifying playing now for %s - %s",
+            "Notifying playing now for %s - %s: %s",
             player_queue.track_metadata.artist_name,
             player_queue.track_metadata.track_name,
+            player_queue.track_metadata.to_json(),
         )
 
     def _queue_updated(self, event: MassEvent) -> None:
         queue_id = event.object_id
         player_queue = self._get_player_queue(queue_id)
-        new_player_queue = ListenBrainzPlayerQueue.from_player_queue(cast(PlayerQueue, event.data))
+        new_player_queue = self._create_player_queue(cast(PlayerQueue, event.data))
 
         if new_player_queue.state != PlayerState.PLAYING:
             # Playback has been stopped or paused
@@ -310,3 +370,27 @@ class ListenBrainz(PluginProvider):
 
     def _queue_time_updated(self, event: MassEvent) -> None:
         self._record_listen(event.object_id)
+
+    @throttle_with_retries
+    async def post_data(self, endpoint: str, **kwargs: dict[str, Any]) -> Any:
+        """Get data from api."""
+        url = f"http://musicbrainz.org/ws/2/{endpoint}"
+        headers = {
+            "User-Agent": f"Music Assistant/{self.mass.version} (https://music-assistant.io)"
+        }
+        kwargs["fmt"] = "json"  # type: ignore[assignment]
+        async with (
+            self.mass.http_session.get(url, headers=headers, params=kwargs) as response,
+        ):
+            # handle rate limiter
+            if response.status == 429:
+                backoff_time = int(response.headers.get("Retry-After", 0))
+                raise ResourceTemporarilyUnavailable("Rate Limiter", backoff_time=backoff_time)
+            # handle temporary server error
+            if response.status in (502, 503):
+                raise ResourceTemporarilyUnavailable(backoff_time=30)
+            # handle 404 not found
+            if response.status in (400, 401, 404):
+                return None
+            response.raise_for_status()
+            return await response.json(loads=json_loads)
